@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>NutriLens — КБЖУ по фото</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="NutriLens">
+<meta name="theme-color" content="#0f172a">
+<meta name="format-detection" content="telephone=no">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="manifest" href="manifest.webmanifest">
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body{background:#0f172a;color:#e2e8f0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-tap-highlight-color:transparent}
+  .sk{background:linear-gradient(90deg,#1e293b,#334155,#1e293b);background-size:200% 100%;animation:sh 1.2s infinite;border-radius:.75rem}
+  @keyframes sh{to{background-position:-200% 0}}
+  .bar{transition:width .5s ease}
+  html{-webkit-text-size-adjust:100%;overscroll-behavior-y:none}
+  body{padding-top:env(safe-area-inset-top,0px);touch-action:manipulation;-webkit-user-select:none;user-select:none}
+  input,select{-webkit-user-select:text;user-select:text;font-size:16px;-webkit-appearance:none;appearance:none}
+  video{-webkit-transform:translateZ(0)}
+  input,select{background:#0f172a;border:1px solid #334155;border-radius:.75rem;padding:.6rem .75rem;width:100%;color:#e2e8f0;outline:none}
+  input:focus,select:focus{border-color:#10b981}
+  button{transition:transform .15s,background .2s} button:active{transform:scale(.97)}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div id="app" class="max-w-xl mx-auto px-4 pt-5 pb-28"></div>
+<script>
+/* ---------- Helpers: storage ---------- */
+const Store = {
+  get(k, d){ try { const v = localStorage.getItem('nl_' + k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v){ try { localStorage.setItem('nl_' + k, JSON.stringify(v)); } catch(e){ console.warn('Storage error', e); } }
+};
+const today = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); };
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = v => { const n = parseFloat(String(v).replace(',', '.')); return isFinite(n) && n >= 0 ? n : 0; };
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+/* ---------- Helpers: AI ---------- */
+const PROMPT = 'Ты — нутрициолог и эксперт по распознаванию еды на фото. Определи блюдо или продукты на изображении, оцени вес порции в граммах и рассчитай КБЖУ для всей порции. Отвечай СТРОГО валидным JSON без markdown и пояснений в формате: {"food_name": string, "weight_g": number, "calories": number, "proteins": number, "fats": number, "carbs": number, "health_tips": string[]}. Название и советы — на русском, 1–3 коротких совета. Если на фото нет еды, верни food_name "Еда не распознана" и нули.';
+
+function parseJSON(text){
+  const m = String(text).replace(/```json|```/g, '').match(/\{[\s\S]*\}/);
+  if (!m) throw new Error('Модель вернула ответ не в формате JSON');
+  return JSON.parse(m[0]);
+}
+function normalize(o){
+  if (!o || typeof o.food_name !== 'string') throw new Error('В ответе нет названия блюда');
+  const f = ['weight_g','calories','proteins','fats','carbs'];
+  for (const k of f) if (typeof o[k] !== 'number' || !isFinite(o[k])) throw new Error('Неверное поле в ответе: ' + k);
+  return { name: o.food_name, weight: Math.round(o.weight_g), cal: Math.round(o.calories), p: +o.proteins.toFixed(1), f: +o.fats.toFixed(1), c: +o.carbs.toFixed(1), tips: Array.isArray(o.health_tips) ? o.health_tips.map(String).slice(0,4) : [] };
+}
+async function callGemini(key, b64, mime){
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+    body: JSON.stringify({ contents: [{ parts: [{ text: PROMPT }, { inline_data: { mime_type: mime, data: b64 } }] }], generationConfig: { responseMimeType: 'application/json' } })
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error?.message || 'Ошибка Gemini API (' + r.status + ')');
+  return parseJSON(d.candidates?.[0]?.content?.parts?.[0]?.text || '');
+}
+async function callClaude(key, b64, mime){
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 800, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: mime, data: b64 } }, { type: 'text', text: PROMPT }] }] })
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error?.message || 'Ошибка Claude API (' + r.status + ')');
+  return parseJSON((d.content || []).map(x => x.text || '').join(''));
+}
+const MOCKS = [
+  ['Салат Цезарь с курицей', 250, 350, 28, 14, 12, ['Попросите соус отдельно — так меньше жиров.', 'Хорошее блюдо для ужина: много белка.']],
+  ['Паста карбонара', 300, 620, 24, 28, 68, ['Добавьте овощной салат для клетчатки.']],
+  ['Овсянка с ягодами', 280, 290, 9, 6, 49, ['Отличный завтрак: медленные углеводы.', 'Орехи добавят полезных жиров.']],
+  ['Лосось с рисом и брокколи', 350, 520, 36, 18, 52, ['Омега-3 из лосося полезны для сердца.']],
+  ['Пицца Маргарита, 2 куска', 220, 560, 22, 20, 70, ['Съешьте с овощами, чтобы дольше не хотелось есть.']]
+];
+function mockResult(){
+  const m = MOCKS[Math.floor(Math.random() * MOCKS.length)], k = 0.9 + Math.random() * 0.2;
+  return { name: m[0], weight: Math.round(m[1] * k), cal: Math.round(m[2] * k), p: +(m[3] * k).toFixed(1), f: +(m[4] * k).toFixed(1), c: +(m[5] * k).toFixed(1), tips: m[6] };
+}
+async function analyzeImage(dataUrl, provider, key){
+  if (!key) { await new Promise(r => setTimeout(r, 1400)); return mockResult(); }
+  const mime = dataUrl.slice(5, dataUrl.indexOf(';')), b64 = dataUrl.split(',')[1];
+  const raw = provider === 'claude' ? await callClaude(key, b64, mime) : await callGemini(key, b64, mime);
+  return normalize(raw);
+}
+function downscale(src, max = 1024){
+  return new Promise((res, rej) => {
+    const im = new Image();
+    im.onload = () => {
+      const k = Math.min(1, max / Math.max(im.width, im.height)), c = document.createElement('canvas');
+      c.width = Math.round(im.width * k); c.height = Math.round(im.height * k);
+      c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
+      res(c.toDataURL('image/jpeg', 0.85));
+    };
+    im.onerror = () => rej(new Error('Не удалось прочитать изображение'));
+    im.src = src;
+  });
+}
+
+/* ---------- State ---------- */
+const CATS = ['Завтрак', 'Обед', 'Ужин', 'Перекус'];
+const S = {
+  tab: 'diary',
+  meals: Store.get('meals', []),
+  habits: Store.get('habits', [{ id: 'h1', text: 'Выпить 2 литра воды', doneDate: '' }, { id: 'h2', text: 'Принять витамины', doneDate: '' }, { id: 'h3', text: 'Прогулка 30 минут', doneDate: '' }]),
+  goals: Store.get('goals', { cal: 2000, p: 120, f: 65, c: 250 }),
+  key: Store.get('key', ''), provider: Store.get('provider', 'gemini'),
+  partners: Store.get('partners', { food: { name: 'Здоровая еда с доставкой', url: '' }, supp: { name: 'Спортпит и добавки', url: '' }, gym: { name: 'Абонементы в зал', url: '' } }),
+  events: Store.get('events', []),
+  scan: { img: null, res: null, base: null, cat: 'Обед', busy: false, err: '', cam: false }
+};
+let stream = null;
+const save = () => { Store.set('meals', S.meals); Store.set('habits', S.habits); Store.set('goals', S.goals); Store.set('key', S.key); Store.set('provider', S.provider); Store.set('partners', S.partners); Store.set('events', S.events); };
+
+/* ---------- Helpers: stats, partner offers, analytics, export ---------- */
+const track = t => { S.events.push({ t, d: today() }); if (S.events.length > 2000) S.events.shift(); save(); };
+const count = t => S.events.filter(e => e.t === t).length;
+const shiftDay = n => { const d = new Date(); d.setDate(d.getDate() - n); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+const dayCal = d => S.meals.filter(m => m.date === d && m.done).reduce((a, m) => a + m.cal, 0);
+function streak(){ let n = 0, i = dayCal(today()) > 0 ? 0 : 1; while (dayCal(shiftDay(i)) > 0) { n++; i++; } return n; }
+function offers(t){
+  const g = S.goals, o = [], hr = new Date().getHours();
+  if (t.p < g.p * 0.6 && hr >= 14) o.push(['supp', 'Не хватает белка: ' + Math.round(g.p - t.p) + ' г до нормы', 'Протеин и батончики помогут добрать норму.']);
+  if (t.cal < g.cal * 0.5 && hr >= 17) o.push(['food', 'Осталось ' + Math.round(g.cal - t.cal) + ' ккал', 'Сбалансированный ужин с доставкой, КБЖУ уже посчитано.']);
+  if (S.habits.some(h => /прогулк|трениров|спорт|шаг/i.test(h.text))) o.push(['gym', 'Активность в ваших привычках', 'Абонемент поможет делать её регулярно.']);
+  if (!o.length) o.push(['food', 'Планируйте питание заранее', 'Готовые наборы еды с понятным КБЖУ.']);
+  return o.slice(0, 2);
+}
+function exportCSV(){
+  const q = v => { v = String(v); if (/^[=+\-@]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; };
+  const rows = [['Дата', 'Прием пищи', 'Блюдо', 'Вес, г', 'Ккал', 'Белки', 'Жиры', 'Углеводы', 'Съедено']].concat(S.meals.map(m => [m.date, m.cat, m.name, m.weight, m.cal, m.p, m.f, m.c, m.done ? 'да' : 'нет']));
+  const blob = new Blob(['\ufeff' + rows.map(r => r.map(q).join(',')).join('\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'nutrilens-diary.csv'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+/* ---------- Icons ---------- */
+const IC = {
+  book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5z"/><path d="M8 7h8M8 11h6"/>',
+  cam: '<path d="M14.5 4h-5L8 6H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-4z"/><circle cx="12" cy="12.5" r="3.5"/>',
+  heart: '<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1 1.1L12 21l7.8-7.5 1-1.1a5.5 5.5 0 0 0 0-7.8z"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  trash: '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  up: '<path d="M12 16V4M7 9l5-5 5 5M4 20h16"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>'
+};
+const ic = (n, s = 20) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${IC[n]}</svg>`;
+
+/* ---------- Views ---------- */
+const todayMeals = () => S.meals.filter(m => m.date === today());
+function totals(){ return todayMeals().filter(m => m.done).reduce((a, m) => ({ cal: a.cal + m.cal, p: a.p + m.p, f: a.f + m.f, c: a.c + m.c }), { cal: 0, p: 0, f: 0, c: 0 }); }
+function bar(label, val, goal, color, unit){
+  const pct = goal ? Math.min(100, Math.round(val / goal * 100)) : 0, over = goal && val > goal;
+  return `<div class="mb-3"><div class="flex justify-between text-sm mb-1"><span class="text-slate-300">${label}</span><span class="${over ? 'text-amber-400' : 'text-slate-400'}">${Math.round(val)} / ${goal} ${unit} · ${Math.round(goal ? val / goal * 100 : 0)}%</span></div><div class="h-2.5 rounded-full bg-slate-800 overflow-hidden"><div class="bar h-full rounded-full ${over ? 'bg-amber-400' : color}" style="width:${pct}%"></div></div></div>`;
+}
+function viewDiary(){
+  const t = totals(), g = S.goals;
+  const groups = CATS.map(cat => {
+    const items = todayMeals().filter(m => m.cat === cat);
+    if (!items.length) return '';
+    return `<h3 class="text-sm font-semibold text-slate-400 mt-5 mb-2">${cat}</h3>` + items.map(m => `
+      <div class="flex items-center gap-3 bg-slate-800/60 border border-slate-700/50 rounded-2xl p-3 mb-2">
+        <button onclick="A.toggleMeal('${m.id}')" aria-label="Отметить" class="w-7 h-7 shrink-0 rounded-full border ${m.done ? 'bg-emerald-500 border-emerald-500 text-slate-900' : 'border-slate-600 text-transparent'} flex items-center justify-center">${ic('check', 16)}</button>
+        <div class="flex-1 min-w-0 ${m.done ? '' : 'opacity-50'}"><div class="font-medium truncate">${esc(m.name)}</div><div class="text-xs text-slate-400">${m.weight} г · ${m.cal} ккал · Б ${m.p} · Ж ${m.f} · У ${m.c}</div></div>
+        <button onclick="A.delMeal('${m.id}')" aria-label="Удалить" class="p-2 text-slate-500 hover:text-red-400">${ic('trash', 18)}</button>
+      </div>`).join('');
+  }).join('');
+  return `<h1 class="text-2xl font-bold mb-1">Сегодня</h1><p class="text-sm text-slate-400 mb-4">${new Date().toLocaleDateString('ru-RU', { weekday: 'long', day: 'numeric', month: 'long' })}</p>
+  <div class="bg-slate-800/60 border border-slate-700/50 rounded-3xl p-4">
+    ${bar('Калории', t.cal, g.cal, 'bg-emerald-500', 'ккал')}${bar('Белки', t.p, g.p, 'bg-indigo-500', 'г')}${bar('Жиры', t.f, g.f, 'bg-sky-500', 'г')}${bar('Углеводы', t.c, g.c, 'bg-fuchsia-500', 'г')}
+  </div>
+  ${extras(t)}${groups || `<div class="text-center text-slate-400 py-12"><p class="mb-4">Сегодня пока ничего не добавлено.</p><button onclick="A.go('scan')" class="bg-emerald-500 text-slate-900 font-semibold rounded-2xl px-5 py-3">Сфотографировать блюдо</button></div>`}`;
+}
+function extras(t){
+  const days = [6, 5, 4, 3, 2, 1, 0].map(i => { const d = shiftDay(i); return [d, dayCal(d)]; }), mx = Math.max(S.goals.cal, ...days.map(x => x[1])), st = streak();
+  const wk = `<div class="bg-slate-800/60 border border-slate-700/50 rounded-3xl p-4 mt-4"><div class="flex justify-between text-sm mb-3"><span>Неделя, ккал</span><span class="text-emerald-400">${st ? 'Серия: ' + st + ' дн.' : 'Начните серию сегодня'}</span></div><div class="flex items-end gap-2 h-24">${days.map(([d, v]) => `<div class="flex-1 flex flex-col items-center justify-end gap-1"><div class="w-full rounded-t-lg ${d === today() ? 'bg-emerald-500' : 'bg-indigo-500/70'}" style="height:${Math.max(3, Math.round(v / mx * 72))}px" title="${v} ккал"></div><span class="text-[10px] text-slate-500">${new Date(d + 'T12:00').toLocaleDateString('ru-RU', { weekday: 'short' })}</span></div>`).join('')}</div></div>`;
+  const of = offers(t).map(([k, h, tx]) => `<button onclick="A.partner('${k}')" class="w-full text-left bg-indigo-500/10 border border-indigo-500/30 rounded-2xl p-3 mt-3 block"><div class="text-[11px] text-slate-500">Партнёрская ссылка</div><div class="font-medium">${esc(h)}</div><div class="text-xs text-slate-400">${esc(tx)} ${esc(S.partners[k].name)}.</div></button>`).join('');
+  return wk + of;
+}
+function viewScan(){
+  const s = S.scan, r = s.res;
+  let body = '';
+  if (s.cam) body = `<video id="vid" autoplay playsinline muted class="w-full rounded-3xl bg-black aspect-[4/3] object-cover"></video>
+    <div class="flex gap-3 mt-3"><button onclick="A.snap()" class="flex-1 bg-emerald-500 text-slate-900 font-semibold rounded-2xl py-3">Сделать снимок</button><button onclick="A.stopCam()" class="px-5 rounded-2xl bg-slate-800">Отмена</button></div>`;
+  else if (!s.img) body = `<div class="grid grid-cols-2 gap-3">
+    <button onclick="A.startCam()" class="bg-slate-800/60 border border-slate-700/50 rounded-3xl py-8 flex flex-col items-center gap-2 text-emerald-400">${ic('cam', 32)}<span class="text-slate-200 font-medium">Камера</span></button>
+    <label class="bg-slate-800/60 border border-slate-700/50 rounded-3xl py-8 flex flex-col items-center gap-2 text-indigo-400 cursor-pointer">${ic('up', 32)}<span class="text-slate-200 font-medium">Загрузить фото</span><input type="file" accept="image/jpeg,image/png,image/webp" class="hidden" onchange="A.file(this)"></label>
+    <label class="col-span-2 bg-emerald-500 text-slate-900 font-semibold rounded-2xl py-4 text-center cursor-pointer">Снять на камеру телефона<input type="file" accept="image/*" capture="environment" class="hidden" onchange="A.file(this)"></label></div>
+    <p class="text-xs text-slate-500 mt-3">${S.key ? 'Режим: реальный анализ (' + (S.provider === 'claude' ? 'Claude' : 'Gemini') + ')' : 'Демо-режим: результат случайный. Добавьте API-ключ во вкладке «Настройки».'}</p>`;
+  else body = `<img src="${s.img}" alt="Фото блюда" class="w-full rounded-3xl aspect-[4/3] object-cover">
+    ${!r && !s.busy ? `<div class="flex gap-3 mt-3"><button onclick="A.analyze()" class="flex-1 bg-emerald-500 text-slate-900 font-semibold rounded-2xl py-3">Распознать КБЖУ</button><button onclick="A.reset()" class="px-5 rounded-2xl bg-slate-800">Другое фото</button></div>` : ''}`;
+  if (s.busy) body += `<div class="mt-4 space-y-3"><div class="sk h-6 w-2/3"></div><div class="sk h-24"></div><p class="text-sm text-slate-400 text-center">Анализируем фото…</p></div>`;
+  if (s.err) body += `<div class="mt-4 p-3 rounded-2xl bg-red-500/10 border border-red-500/30 text-red-300 text-sm">${esc(s.err)}</div>`;
+  if (r) body += `<div class="mt-4 bg-slate-800/60 border border-slate-700/50 rounded-3xl p-4 space-y-3">
+    <div><label class="text-xs text-slate-400">Название</label><input value="${esc(r.name)}" oninput="S.scan.res.name=this.value"></div>
+    <div class="grid grid-cols-2 gap-3"><div><label class="text-xs text-slate-400">Вес, г</label><input id="e_w" type="number" inputmode="decimal" value="${r.weight}" oninput="A.weight(this.value)"></div>
+    <div><label class="text-xs text-slate-400">Ккал</label><input id="e_cal" type="number" inputmode="decimal" value="${r.cal}" oninput="S.scan.res.cal=num(this.value)"></div></div>
+    <div class="grid grid-cols-3 gap-3"><div><label class="text-xs text-slate-400">Белки</label><input id="e_p" type="number" inputmode="decimal" value="${r.p}" oninput="S.scan.res.p=num(this.value)"></div>
+    <div><label class="text-xs text-slate-400">Жиры</label><input id="e_f" type="number" inputmode="decimal" value="${r.f}" oninput="S.scan.res.f=num(this.value)"></div>
+    <div><label class="text-xs text-slate-400">Углеводы</label><input id="e_c" type="number" inputmode="decimal" value="${r.c}" oninput="S.scan.res.c=num(this.value)"></div></div>
+    <div><label class="text-xs text-slate-400">Прием пищи</label><select onchange="S.scan.cat=this.value">${CATS.map(c => `<option ${c === s.cat ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
+    ${r.tips.length ? `<ul class="text-sm text-emerald-300/90 space-y-1">${r.tips.map(x => `<li>• ${esc(x)}</li>`).join('')}</ul>` : ''}
+    <div class="flex gap-3"><button onclick="A.addMeal()" class="flex-1 bg-emerald-500 text-slate-900 font-semibold rounded-2xl py-3">Добавить в дневник</button><button onclick="A.reset()" class="px-5 rounded-2xl bg-slate-800">Отмена</button></div></div>`;
+  return `<h1 class="text-2xl font-bold mb-4">Сканер еды</h1>${body}`;
+}
+function viewHealth(){
+  const d = today(), done = S.habits.filter(h => h.doneDate === d).length, pct = S.habits.length ? Math.round(done / S.habits.length * 100) : 0;
+  return `<h1 class="text-2xl font-bold mb-4">Здоровье</h1>
+  <div class="bg-slate-800/60 border border-slate-700/50 rounded-3xl p-4 mb-4"><div class="flex justify-between text-sm mb-2"><span>Прогресс за день</span><span class="text-emerald-400 font-semibold">${pct}%</span></div><div class="h-2.5 rounded-full bg-slate-800 overflow-hidden"><div class="bar h-full bg-gradient-to-r from-emerald-500 to-indigo-500" style="width:${pct}%"></div></div></div>
+  ${S.habits.map(h => `<div class="flex items-center gap-3 bg-slate-800/60 border border-slate-700/50 rounded-2xl p-3 mb-2">
+    <button onclick="A.toggleHabit('${h.id}')" aria-label="Отметить" class="w-7 h-7 shrink-0 rounded-full border ${h.doneDate === d ? 'bg-emerald-500 border-emerald-500 text-slate-900' : 'border-slate-600 text-transparent'} flex items-center justify-center">${ic('check', 16)}</button>
+    <span class="flex-1 ${h.doneDate === d ? 'line-through text-slate-500' : ''}">${esc(h.text)}</span>
+    <button onclick="A.delHabit('${h.id}')" aria-label="Удалить" class="p-2 text-slate-500 hover:text-red-400">${ic('x', 18)}</button></div>`).join('') || '<p class="text-slate-400 text-center py-6">Добавьте первую привычку ниже.</p>'}
+  <div class="flex gap-2 mt-4"><input id="newHabit" placeholder="Например: 10 000 шагов" onkeydown="if(event.key==='Enter')A.addHabit()"><button onclick="A.addHabit()" aria-label="Добавить" class="px-4 rounded-xl bg-indigo-500 text-white">${ic('plus')}</button></div>`;
+}
+function viewSettings(){
+  const g = S.goals;
+  const gi = (k, l) => `<div><label class="text-xs text-slate-400">${l}</label><input type="number" inputmode="decimal" value="${g[k]}" onchange="A.goal('${k}',this.value)"></div>`;
+  return `<h1 class="text-2xl font-bold mb-4">Настройки</h1>
+  <div class="bg-slate-800/60 border border-slate-700/50 rounded-3xl p-4 space-y-3 mb-4"><h2 class="font-semibold">AI-распознавание</h2>
+    <select onchange="S.provider=this.value;save()"><option value="gemini" ${S.provider === 'gemini' ? 'selected' : ''}>Google Gemini</option><option value="claude" ${S.provider === 'claude' ? 'selected' : ''}>Anthropic Claude</option></select>
+    <input id="apikey" type="password" autocomplete="off" placeholder="API-ключ (пусто — демо-режим)" value="${esc(S.key)}">
+    <div class="flex gap-3"><button onclick="A.saveKey()" class="flex-1 bg-emerald-500 text-slate-900 font-semibold rounded-2xl py-3">Сохранить ключ</button><button onclick="A.clearKey()" class="px-5 rounded-2xl bg-slate-800">Удалить</button></div>
+    <p class="text-xs text-slate-500">Ключ хранится только в localStorage вашего браузера и уходит напрямую провайдеру.</p></div>
+  <div class="bg-slate-800/60 border border-slate-700/50 rounded-3xl p-4"><h2 class="font-semibold mb-3">Дневная норма</h2><div class="grid grid-cols-2 gap-3">${gi('cal', 'Калории, ккал')}${gi('p', 'Белки, г')}${gi('f', 'Жиры, г')}${gi('c', 'Углеводы, г')}</div></div>
+  <div class="bg-slate-800/60 border border-slate-700/50 rounded-3xl p-4 mt-4 space-y-3"><h2 class="font-semibold">Партнёры</h2>${Object.entries(S.partners).map(([k, p]) => `<div><label class="text-xs text-slate-400">${esc(p.name)}: партнёрская ссылка</label><input type="url" placeholder="https://..." value="${esc(p.url)}" onchange="A.partnerUrl('${k}',this.value)"></div>`).join('')}<p class="text-xs text-slate-500">Подборки в дневнике ведут по этим ссылкам и подписаны как партнёрские.</p></div>
+  <div class="bg-slate-800/60 border border-slate-700/50 rounded-3xl p-4 mt-4 space-y-3"><h2 class="font-semibold">Статистика и экспорт</h2><p class="text-sm text-slate-400">Сканов: ${count('scan')} · Добавлено блюд: ${count('meal')} · Переходов к партнёрам: ${count('partner')}</p><button onclick="exportCSV()" class="w-full bg-indigo-500 text-white font-semibold rounded-2xl py-3">Скачать дневник (CSV)</button></div>`;
+}
+function nav(){
+  const t = [['diary', 'book', 'Дневник'], ['scan', 'cam', 'Скан'], ['health', 'heart', 'Здоровье'], ['settings', 'gear', 'Настройки']];
+  return `<nav class="fixed bottom-0 inset-x-0 bg-slate-900/90 backdrop-blur border-t border-slate-800" style="padding-bottom:env(safe-area-inset-bottom,0px)"><div class="max-w-xl mx-auto grid grid-cols-4">${t.map(([k, i, l]) => `<button onclick="A.go('${k}')" class="py-3 flex flex-col items-center gap-1 text-xs ${S.tab === k ? 'text-emerald-400' : 'text-slate-500'}">${ic(i, 22)}${l}</button>`).join('')}</div></nav>`;
+}
+function render(){
+  const v = { diary: viewDiary, scan: viewScan, health: viewHealth, settings: viewSettings }[S.tab]();
+  document.getElementById('app').innerHTML = v + nav();
+  const vid = document.getElementById('vid');
+  if (vid && stream) vid.srcObject = stream;
+}
+
+/* ---------- Actions ---------- */
+const A = {
+  go(t){ if (t !== 'scan') A.stopCam(true); S.tab = t; render(); window.scrollTo(0, 0); },
+  toggleMeal(id){ const m = S.meals.find(x => x.id === id); if (m) m.done = !m.done; save(); render(); },
+  delMeal(id){ S.meals = S.meals.filter(x => x.id !== id); save(); render(); },
+  toggleHabit(id){ const h = S.habits.find(x => x.id === id); if (h) h.doneDate = h.doneDate === today() ? '' : today(); save(); render(); },
+  delHabit(id){ S.habits = S.habits.filter(x => x.id !== id); save(); render(); },
+  addHabit(){ const i = document.getElementById('newHabit'), t = i.value.trim(); if (!t) return; S.habits.push({ id: uid(), text: t, doneDate: '' }); save(); render(); },
+  partner(k){
+    const u = S.partners[k].url;
+    if (!u) { alert('Укажите партнёрскую ссылку в «Настройки → Партнёры».'); return A.go('settings'); }
+    track('partner'); window.open(u, '_blank', 'noopener');
+  },
+  partnerUrl(k, v){ v = v.trim(); S.partners[k].url = /^https?:\/\//i.test(v) ? v : ''; save(); render(); },
+  goal(k, v){ S.goals[k] = Math.max(1, num(v)); save(); },
+  saveKey(){ S.key = document.getElementById('apikey').value.trim(); save(); render(); },
+  clearKey(){ S.key = ''; save(); render(); },
+  async startCam(){
+    S.scan.err = '';
+    if (!navigator.mediaDevices?.getUserMedia) { S.scan.err = 'Камера недоступна в этом браузере. Загрузите фото из файла.'; return render(); }
+    try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false }); S.scan.cam = true; }
+    catch (e) { S.scan.err = 'Нет доступа к камере (' + (e.name || 'ошибка') + '). Разрешите доступ в настройках браузера или загрузите фото из файла.'; }
+    render();
+  },
+  stopCam(silent){ if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; } S.scan.cam = false; if (!silent) render(); },
+  async snap(){
+    const v = document.getElementById('vid');
+    if (!v || !v.videoWidth) { S.scan.err = 'Камера еще не готова, попробуйте через секунду.'; return render(); }
+    const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
+    c.getContext('2d').drawImage(v, 0, 0);
+    try { S.scan.img = await downscale(c.toDataURL('image/jpeg', 0.9)); } catch (e) { S.scan.err = e.message; }
+    A.stopCam(true); render();
+  },
+  file(inp){
+    const f = inp.files[0]; if (!f) return;
+    if (!/^image\/(jpeg|png|webp)$/.test(f.type)) { S.scan.err = 'Поддерживаются только JPEG, PNG и WebP.'; return render(); }
+    const fr = new FileReader();
+    fr.onload = async () => { try { S.scan.img = await downscale(fr.result); S.scan.err = ''; } catch (e) { S.scan.err = e.message; } render(); };
+    fr.onerror = () => { S.scan.err = 'Не удалось прочитать файл.'; render(); };
+    fr.readAsDataURL(f);
+  },
+  async analyze(){
+    S.scan.busy = true; S.scan.err = ''; render();
+    try {
+      const r = await analyzeImage(S.scan.img, S.provider, S.key);
+      track('scan'); S.scan.res = r; S.scan.base = { w: r.weight || 1, cal: r.cal, p: r.p, f: r.f, c: r.c };
+    } catch (e) {
+      S.scan.err = e instanceof TypeError ? 'Нет связи с API. Проверьте интернет и ключ. Если файл открыт не локально, браузер может блокировать запросы.' : 'Ошибка анализа: ' + e.message;
+    }
+    S.scan.busy = false; render();
+  },
+  weight(v){
+    const r = S.scan.res, b = S.scan.base, w = num(v); r.weight = w;
+    if (!b) return;
+    const k = w / b.w;
+    r.cal = Math.round(b.cal * k); r.p = +(b.p * k).toFixed(1); r.f = +(b.f * k).toFixed(1); r.c = +(b.c * k).toFixed(1);
+    [['e_cal', r.cal], ['e_p', r.p], ['e_f', r.f], ['e_c', r.c]].forEach(([id, val]) => { document.getElementById(id).value = val; });
+  },
+  addMeal(){
+    const r = S.scan.res;
+    S.meals.push({ id: uid(), date: today(), cat: S.scan.cat, name: r.name.trim() || 'Без названия', weight: num(r.weight), cal: num(r.cal), p: num(r.p), f: num(r.f), c: num(r.c), done: true });
+    track('meal'); A.reset(true); S.tab = 'diary'; render();
+  },
+  reset(silent){ S.scan = { img: null, res: null, base: null, cat: S.scan.cat, busy: false, err: '', cam: false }; if (!silent) render(); }
+};
+window.addEventListener('pagehide', () => A.stopCam(true));
+render();
+</script>
+</body>
+</html>
